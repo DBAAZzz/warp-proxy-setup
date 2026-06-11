@@ -442,18 +442,53 @@ parse_wgcf_profile() {
     parse_wgcf_reserved
 }
 
+# 从 wgcf-account.toml 提取一个 TOML 键的值（兼容单/双引号）
+account_get() {
+    sed -n "s/^${1}[[:space:]]*=[[:space:]]*['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}$/\1/p" \
+        "${WGCF_DIR}/wgcf-account.toml" | head -n 1 | tr -d ' \r'
+}
+
 # WARP 要求 WireGuard 包头携带 3 字节 client_id（reserved 字段）。
-# wgcf 的 profile 不含它，必须从 wgcf-account.toml 的 client_id（base64）解码。
 # 缺少 reserved 的典型症状：握手"成功"、无报错，但所有数据包被 Cloudflare 静默丢弃。
+# 注意：wgcf 不会把 client_id 写进 wgcf-account.toml（文件里只有 device_id /
+# access_token / private_key / license_key），必须用 device_id + access_token
+# 调用 Cloudflare 设备 API 查询。结果缓存到 ${WGCF_DIR}/client_id 避免重复请求。
 parse_wgcf_reserved() {
     WG_RESERVED_JSON=""
-    local client_id
-    client_id=$(sed -n "s/^client_id[[:space:]]*=[[:space:]]*['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}$/\1/p" \
-        "${WGCF_DIR}/wgcf-account.toml" | head -n 1 | tr -d ' \r')
+    local client_id=""
+    local cache_file="${WGCF_DIR}/client_id"
+
+    if [ -f "$cache_file" ]; then
+        client_id=$(tr -d ' \r\n' < "$cache_file")
+        log "使用缓存的 client_id（${cache_file}）"
+    fi
 
     if [ -z "$client_id" ]; then
-        warn "wgcf-account.toml 中未找到 client_id，跳过 reserved 字段（若代理挂起需手动排障）"
-        return
+        local device_id access_token resp
+        device_id=$(account_get "device_id")
+        access_token=$(account_get "access_token")
+        if [ -z "$device_id" ] || [ -z "$access_token" ]; then
+            warn "wgcf-account.toml 中缺少 device_id / access_token，无法获取 client_id"
+            warn "跳过 reserved 字段（若代理请求挂起，这就是原因）"
+            return
+        fi
+        log "调用 Cloudflare API 获取 client_id（设备: ${device_id}）..."
+        resp=$(curl -fsSL --max-time 20 \
+            -H "Authorization: Bearer ${access_token}" \
+            -H "Accept: application/json" \
+            -H "User-Agent: okhttp/3.12.1" \
+            "https://api.cloudflareclient.com/v0a2158/reg/${device_id}" 2>/dev/null || true)
+        # 提取 "client_id":"..."，并还原 JSON 对 "/" 的 \/ 转义（base64 可能含 / + =）
+        client_id=$(printf '%s' "$resp" \
+            | sed -n 's/.*"client_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | head -n 1 | sed 's_\\/_/_g')
+        if [ -z "$client_id" ]; then
+            warn "Cloudflare API 未返回 client_id（接口变更或 access_token 失效）"
+            warn "跳过 reserved 字段（若代理请求挂起，这就是原因）"
+            return
+        fi
+        printf '%s\n' "$client_id" > "$cache_file"
+        chmod 600 "$cache_file"
     fi
 
     local bytes

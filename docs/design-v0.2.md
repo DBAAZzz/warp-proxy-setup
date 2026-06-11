@@ -128,7 +128,10 @@ GitHub 直连
 3. 生成配置（幂等：profile 存在则跳过）
      wgcf generate → wgcf-profile.conf
 4. 解析 profile 中的 PrivateKey / Address / PublicKey / Endpoint
-5. 从 wgcf-account.toml 解析 client_id → 解码为 3 字节 reserved 值（见下）
+5. 获取 client_id → 解码为 3 字节 reserved 值（见下）
+     用 wgcf-account.toml 的 device_id + access_token 调用
+     api.cloudflareclient.com/v0a2158/reg/<device_id>
+     结果缓存到 /etc/warp-proxy/wgcf/client_id（600 权限），幂等重跑不重复请求
 6. Endpoint 域名（engage.cloudflareclient.com）解析为 IP
      解析失败时回退到已知锚点 IP 162.159.192.1:2408
 7. 渲染 sing-box 配置（wireguard endpoint 格式，MTU 1280）
@@ -166,13 +169,17 @@ sing-box wireguard endpoint 配置模板（1.11+ 格式）：
 }
 ```
 
-**reserved 字段（必须，真机验证过的坑）：** WARP 要求 WireGuard 包头携带 3 字节 client_id（即 `reserved`），wgcf 生成的 profile 里**不含**这个字段。缺少它的症状极具迷惑性：UDP 端点可达、sing-box 日志无任何报错、服务状态 active，但所有经隧道的数据包被 Cloudflare **静默丢弃**，表现为代理请求整体挂起（CentOS 7 真机复现）。标准 WireGuard 客户端不受影响是因为 wgcf 注册的账号配合官方 IP 段路由时 Cloudflare 侧放行，但 sing-box 用户态实现必须显式携带。安装流程从 `wgcf-account.toml` 提取 `client_id`（base64）：
+**reserved 字段（必须，真机验证过的坑）：** WARP 要求 WireGuard 包头携带 3 字节 client_id（即 `reserved`），wgcf 生成的 profile 里**不含**这个字段。缺少它的症状极具迷惑性：UDP 端点可达、sing-box 日志无任何报错、服务状态 active，但所有经隧道的数据包被 Cloudflare **静默丢弃**，表现为代理请求整体挂起（CentOS 7 真机复现）。
+
+注意 **wgcf-account.toml 里也没有 client_id**（文件只含 device_id / access_token / private_key / license_key，真机验证），必须调用 Cloudflare 设备 API 查询：
 
 ```bash
-client_id 'kc1y' → base64 -d → od -tu1 → [145, 205, 114]
+curl -H "Authorization: Bearer <access_token>" \
+  https://api.cloudflareclient.com/v0a2158/reg/<device_id>
+# 响应 JSON 含 "client_id":"kc\/y" → 还原 \/ 转义 → base64 -d → od -tu1 → [145, 207, 242]
 ```
 
-解析失败（无 client_id / 解码不是 3 字节）时降级为不渲染 reserved 并输出警告，不中断安装。
+结果缓存到 `/etc/warp-proxy/wgcf/client_id`（600 权限）。获取失败（接口变更 / token 失效）时降级为不渲染 reserved 并输出警告，不中断安装——但代理大概率会挂起，警告信息中已注明因果。该 API 与 wgcf 注册接口同属未公开接口，是 wireguard backend 的固有风险面。
 
 ---
 
