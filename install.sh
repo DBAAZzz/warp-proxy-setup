@@ -37,6 +37,10 @@ readonly SING_BOX_VERSION="${SING_BOX_VERSION:-1.12.4}"
 readonly WGCF_VERSION="${WGCF_VERSION:-2.2.26}"
 # WARP WireGuard 端点域名解析失败时的回退锚点
 readonly WARP_ENDPOINT_FALLBACK_IP="162.159.192.1"
+# 候选端点扫描列表：默认端点 2408 在部分线路（尤其大陆）受针对性干扰，
+# 握手包被丢但 nc 探测仍"通"。按序实测，锁定第一个能跑通 warp=on 的组合。
+# 可用 WARP_ENDPOINT_CANDIDATES 环境变量覆盖（空格分隔的 ip:port 列表）。
+readonly WARP_ENDPOINT_CANDIDATES="${WARP_ENDPOINT_CANDIDATES:-162.159.192.1:2408 162.159.193.10:2408 188.114.96.1:2408 188.114.97.1:2408 162.159.192.1:500 162.159.192.1:854 162.159.192.1:1701 162.159.192.1:4500 162.159.192.1:8854 162.159.193.10:854}"
 
 # GitHub Releases 在大陆服务器经常不可达，依次尝试：直连 → 加速镜像。
 # 镜像用法均为 "前缀 + 完整 GitHub URL"。可用 GITHUB_MIRROR 指定自有镜像（最高优先）。
@@ -425,19 +429,29 @@ parse_wgcf_profile() {
 
     WG_ADDRESS_JSON=$(echo "$addresses" | awk '{printf "%s\"%s\"", (NR>1?", ":""), $0}')
 
-    # Endpoint 形如 engage.cloudflareclient.com:2408，解析域名为 IP（失败回退锚点 IP）
-    local host port ip
-    host=${endpoint%:*}
-    port=${endpoint##*:}
-    [ -n "$port" ] || port="2408"
-    ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')
-    if [ -z "$ip" ]; then
-        warn "无法解析 WARP 端点域名 ${host}，回退使用锚点 IP ${WARP_ENDPOINT_FALLBACK_IP}"
-        ip="$WARP_ENDPOINT_FALLBACK_IP"
+    # 端点选择优先级：上次扫描验证过的缓存 > profile 域名解析 > 锚点 IP
+    local cached="${WGCF_DIR}/endpoint"
+    if [ -f "$cached" ] && grep -q ':' "$cached"; then
+        local ep
+        ep=$(tr -d ' \r\n' < "$cached")
+        WG_PEER_IP=${ep%:*}
+        WG_PEER_PORT=${ep##*:}
+        log "使用上次验证过的 WARP 端点: ${WG_PEER_IP}:${WG_PEER_PORT}（${cached}）"
+    else
+        # Endpoint 形如 engage.cloudflareclient.com:2408，解析域名为 IP（失败回退锚点 IP）
+        local host port ip
+        host=${endpoint%:*}
+        port=${endpoint##*:}
+        [ -n "$port" ] || port="2408"
+        ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')
+        if [ -z "$ip" ]; then
+            warn "无法解析 WARP 端点域名 ${host}，回退使用锚点 IP ${WARP_ENDPOINT_FALLBACK_IP}"
+            ip="$WARP_ENDPOINT_FALLBACK_IP"
+        fi
+        WG_PEER_IP="$ip"
+        WG_PEER_PORT="$port"
+        log "WARP WireGuard 端点: ${WG_PEER_IP}:${WG_PEER_PORT}"
     fi
-    WG_PEER_IP="$ip"
-    WG_PEER_PORT="$port"
-    log "WARP WireGuard 端点: ${WG_PEER_IP}:${WG_PEER_PORT}"
 
     parse_wgcf_reserved
 }
@@ -683,6 +697,62 @@ EOF
     log "systemd 桥接服务已启动: ${BRIDGE_SERVICE} (backend=${BACKEND})"
 }
 
+# 经 18080 代理实测出口：返回 trace 内容（含 warp=on 才算真通）
+probe_warp_via_proxy() {
+    local probe_host="$HTTP_LISTEN_HOST" timeout="${1:-15}"
+    [ "$probe_host" = "0.0.0.0" ] && probe_host="127.0.0.1"
+    curl -s -x "http://${probe_host}:${HTTP_PROXY_PORT}" \
+        https://www.cloudflare.com/cdn-cgi/trace --max-time "$timeout" 2>/dev/null || true
+}
+
+# wireguard backend：当前端点不通时，自动扫描候选端点列表。
+# 对每个候选：重写 sing-box 配置 → 重启桥接 → 等待握手 → 实测 warp=on。
+scan_warp_endpoints() {
+    local current="${WG_PEER_IP}:${WG_PEER_PORT}"
+    warn "当前端点 ${current} 实测不通（握手被丢弃或线路干扰），开始扫描候选端点..."
+
+    local cand ip port trace
+    for cand in $WARP_ENDPOINT_CANDIDATES; do
+        [ "$cand" = "$current" ] && continue
+        ip=${cand%:*}
+        port=${cand##*:}
+        log "尝试端点 ${ip}:${port} ..."
+        WG_PEER_IP="$ip"
+        WG_PEER_PORT="$port"
+        write_singbox_config >/dev/null 2>&1 || continue
+        systemctl restart "$BRIDGE_SERVICE"
+        sleep 6
+        trace=$(probe_warp_via_proxy 12)
+        if echo "$trace" | grep -qE '^warp=(on|plus)$'; then
+            log "端点 ${ip}:${port} 实测可用（warp=on），锁定使用"
+            printf '%s:%s\n' "$ip" "$port" > "${WGCF_DIR}/endpoint"
+            return 0
+        fi
+    done
+
+    warn "所有候选端点均不通。可能整个 WARP UDP 端口段被线路封锁。"
+    warn "可自定义候选列表重试: WARP_ENDPOINT_CANDIDATES=\"ip:port ip:port\" sudo -E ./install.sh"
+    return 1
+}
+
+# wireguard backend 启动后的端点验证与自愈
+verify_or_scan_endpoint() {
+    log "等待 WireGuard 隧道就绪并实测出口..."
+    local i trace
+    for i in 1 2 3; do
+        sleep 4
+        trace=$(probe_warp_via_proxy 12)
+        if echo "$trace" | grep -qE '^warp=(on|plus)$'; then
+            log "端点 ${WG_PEER_IP}:${WG_PEER_PORT} 实测可用（warp=on）"
+            printf '%s:%s\n' "$WG_PEER_IP" "$WG_PEER_PORT" > "${WGCF_DIR}/endpoint"
+            return 0
+        fi
+    done
+    # 当前端点不通；若它正是之前缓存的端点，先作废缓存再扫描
+    rm -f "${WGCF_DIR}/endpoint"
+    scan_warp_endpoints
+}
+
 # v0.1 遗留清理：GOST 已被 sing-box 取代
 cleanup_v01_gost() {
     if [ -x /usr/local/bin/gost ]; then
@@ -843,6 +913,10 @@ main() {
     write_singbox_config
     write_bridge_service
     cleanup_v01_gost
+
+    if [ "$BACKEND" = "wireguard" ]; then
+        verify_or_scan_endpoint || true
+    fi
 
     if health_check; then
         print_usage_guide

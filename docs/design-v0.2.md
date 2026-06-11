@@ -181,6 +181,21 @@ curl -H "Authorization: Bearer <access_token>" \
 
 结果缓存到 `/etc/warp-proxy/wgcf/client_id`（600 权限）。获取失败（接口变更 / token 失效）时降级为不渲染 reserved 并输出警告，不中断安装——但代理大概率会挂起，警告信息中已注明因果。该 API 与 wgcf 注册接口同属未公开接口，是 wireguard backend 的固有风险面。
 
+**端点自动扫描（真机验证过的第二个坑）：** 默认端点 `engage.cloudflareclient.com:2408` 在部分线路（尤其大陆）受针对性干扰——`nc -u` 探测"通"（UDP 包能发出），但 WireGuard 握手回包被丢，症状与 reserved 缺失完全相同（服务正常、日志干净、代理挂起）。因此 UDP 可达性探测不可信，**唯一可信的检验是经 18080 实测 `warp=on`**。安装流程在桥接服务启动后：
+
+```text
+1. 等待隧道就绪，经 18080 实测 trace（重试 3 次）
+2. warp=on → 锁定当前端点，写入缓存 /etc/warp-proxy/wgcf/endpoint
+3. 不通 → 作废缓存，遍历候选端点列表：
+     162.159.192.1 / 162.159.193.10 / 188.114.96.1 / 188.114.97.1
+     × 端口 2408 / 500 / 854 / 1701 / 4500 / 8854（精选 10 组合）
+   对每个候选：重写 sing-box 配置 → 重启桥接 → 等待 6s → 实测 warp=on
+4. 找到可用端点即锁定并缓存；全部失败则警告（整个 UDP 端口段被封锁）
+     可用 WARP_ENDPOINT_CANDIDATES="ip:port ..." 环境变量自定义候选重试
+```
+
+下次重跑 install.sh 时优先使用缓存端点（已验证可用），避免重复扫描。
+
 ---
 
 ## 6. systemd 兼容性（CentOS 7 / systemd 219）
