@@ -98,6 +98,23 @@ wireguard backend 的 sing-box 配置：
 
 **版本锁定（必须）：** sing-box 1.11 把 WireGuard 从 outbound 迁移到了 endpoint 格式，上游配置 schema 有破坏性变更史。脚本锁定 `SING_BOX_VERSION=1.12.4`、`WGCF_VERSION=2.2.26`（均可用环境变量覆盖），绝不追 latest。
 
+**下载源策略（大陆服务器适配）：** sing-box 与 wgcf 均发布在 GitHub Releases，大陆服务器对 `github.com` / `objects.githubusercontent.com` 经常完全不可达。下载逻辑为多源 fallback + 强制校验：
+
+```text
+GitHub 直连
+  → 失败则依次尝试加速镜像（前缀 + 完整 GitHub URL）：
+      $GITHUB_MIRROR（用户自有镜像，最高优先，可选）
+      https://ghfast.top
+      https://gh-proxy.com
+      https://ghproxy.net
+  → 每个源下载成功后强制 SHA256 校验
+      校验和在脚本内嵌（从官方 GitHub Release 下载后计算）
+      不匹配 = 可能被镜像篡改或截断 → 丢弃，换下一个源
+  → 全部失败则报错退出，提示 GITHUB_MIRROR 自救或手动放置二进制
+```
+
+这正是版本锁定的另一个红利：版本固定 → 官方校验和可以内嵌进脚本 → 第三方镜像（运营方不可控、域名常更换）即使返回被篡改的二进制也会被拦下。**没有校验和的文件一律拒绝安装**（升级锁定版本时必须同步更新脚本内的 `pinned_sha256` 表）。jsDelivr 不支持 Release 二进制，不在备选之列。
+
 从 v0.1 升级：unit 名不变（`warp-proxy-bridge.service`），重跑 install.sh 直接覆盖为 sing-box 版；遗留的 `/usr/local/bin/gost` 由 uninstall.sh 负责清理。
 
 ---

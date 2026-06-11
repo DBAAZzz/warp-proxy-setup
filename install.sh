@@ -38,6 +38,25 @@ readonly WGCF_VERSION="${WGCF_VERSION:-2.2.26}"
 # WARP WireGuard 端点域名解析失败时的回退锚点
 readonly WARP_ENDPOINT_FALLBACK_IP="162.159.192.1"
 
+# GitHub Releases 在大陆服务器经常不可达，依次尝试：直连 → 加速镜像。
+# 镜像用法均为 "前缀 + 完整 GitHub URL"。可用 GITHUB_MIRROR 指定自有镜像（最高优先）。
+# 镜像是第三方服务，存在篡改风险——因此下载后强制 SHA256 校验（见下方内嵌校验和表）。
+readonly GH_MIRRORS="${GITHUB_MIRROR:+${GITHUB_MIRROR} }https://ghfast.top https://gh-proxy.com https://ghproxy.net"
+
+# 锁定版本二进制的官方 SHA256（从 github.com 官方 Release 下载后计算）。
+# 升级 SING_BOX_VERSION / WGCF_VERSION 时必须同步更新本表，否则校验失败拒绝安装。
+pinned_sha256() {
+    case "$1" in
+        sing-box-1.12.4-linux-amd64.tar.gz) echo "8c770d34d27fa81c4d6533bfc75489d706c613831fc8234ca0a7be51e6af2a32" ;;
+        sing-box-1.12.4-linux-arm64.tar.gz) echo "4037fca86cc7c2d78ab09127567584544fc7dc3bba7ff06ba3dba41632827de7" ;;
+        sing-box-1.12.4-linux-armv7.tar.gz) echo "bc3f323493bdc76aa2eebe2f34761a07efa5d7ddcc66cf82044e10f34849e52a" ;;
+        wgcf_2.2.26_linux_amd64)            echo "b49e7c52307df1f0a9ccd13ad12f87bf7ee7092df4e189f064d81860ec6f4bf5" ;;
+        wgcf_2.2.26_linux_arm64)            echo "cbda1a8e4e1144c49ed9a8a2d99f3d5a70e6115ebca62ae3d354d8b074a4ae73" ;;
+        wgcf_2.2.26_linux_armv7)            echo "d523c71a7d294823c4e37af51ef891924069fb23b82a854f01ca2517a479be08" ;;
+        *)                                  echo "" ;;
+    esac
+}
+
 BACKEND="auto"
 MODE="local"
 HTTP_LISTEN_HOST=""
@@ -165,6 +184,66 @@ detect_arch() {
     esac
 }
 
+# 计算文件 SHA256（sha256sum / shasum 自适应，老系统兜底用 openssl）
+file_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | awk '{print $NF}'
+    else
+        echo ""
+    fi
+}
+
+# 从 GitHub Release 下载文件：先直连，失败后依次走加速镜像；
+# 每个下载源成功后都做 SHA256 校验，不匹配则丢弃换下一个源。
+#   $1 = GitHub 完整 URL（github.com/...）
+#   $2 = 本地保存路径
+#   $3 = 文件名（用于查内嵌校验和表）
+download_release() {
+    local gh_url="$1" dest="$2" fname="$3"
+    local expected actual src
+    expected=$(pinned_sha256 "$fname")
+    [ -n "$expected" ] || die "内部错误：${fname} 没有内嵌校验和（升级版本时需同步更新 pinned_sha256 表）"
+
+    for src in "" $GH_MIRRORS; do
+        local url label
+        if [ -z "$src" ]; then
+            url="$gh_url"; label="GitHub 直连"
+        else
+            url="${src}/${gh_url}"; label="镜像 ${src}"
+        fi
+        log "下载 ${fname}（${label}）..."
+        if ! curl -fSL --retry 2 --connect-timeout 10 --max-time 300 -o "$dest" "$url" 2>/dev/null; then
+            warn "${label} 下载失败，尝试下一个源"
+            rm -f "$dest"
+            continue
+        fi
+        actual=$(file_sha256 "$dest")
+        if [ -z "$actual" ]; then
+            warn "系统缺少 sha256sum/shasum/openssl，无法校验完整性，拒绝使用该文件"
+            rm -f "$dest"
+            die "请先安装 coreutils（提供 sha256sum）后重试"
+        fi
+        if [ "$actual" = "$expected" ]; then
+            log "${fname} 下载完成，SHA256 校验通过"
+            return 0
+        fi
+        warn "${label} 下载的 ${fname} SHA256 校验失败（可能被篡改或截断），丢弃并尝试下一个源"
+        warn "  期望: ${expected}"
+        warn "  实际: ${actual}"
+        rm -f "$dest"
+    done
+
+    die "所有下载源（GitHub 直连 + 加速镜像）均失败: ${fname}
+可选自救方式：
+  1. 设置自有镜像: GITHUB_MIRROR=https://your-mirror.example.com sudo -E ./install.sh ...
+  2. 在能访问 GitHub 的机器上手动下载并放置到目标路径后重跑脚本:
+     ${gh_url}"
+}
+
 # Cloudflare WARP 官方客户端是否支持当前系统
 # 支持列表: Ubuntu 22.04+/Debian 12+/RHEL·CentOS 8+/Fedora 34+
 os_officially_supported() {
@@ -274,12 +353,7 @@ install_sing_box() {
     url="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${tarball}"
     tmpdir=$(mktemp -d)
 
-    log "下载 sing-box v${SING_BOX_VERSION} (${arch}) ..."
-    if ! curl -fSL --retry 3 -o "${tmpdir}/${tarball}" "$url"; then
-        rm -rf "$tmpdir"
-        die "下载 sing-box 失败: ${url}
-如服务器无法直连 GitHub，可手动下载后放置为 ${SINGBOX_BIN} 再重新运行本脚本。"
-    fi
+    download_release "$url" "${tmpdir}/${tarball}" "$tarball" || { rm -rf "$tmpdir"; exit 1; }
 
     tar -xzf "${tmpdir}/${tarball}" -C "$tmpdir"
     install -m 0755 "${tmpdir}/${dirname}/sing-box" "$SINGBOX_BIN"
@@ -295,15 +369,11 @@ install_wgcf() {
         log "wgcf 已安装，跳过"
         return
     fi
-    local arch url
+    local arch fname url
     arch=$(detect_arch)
-    url="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_${arch}"
-    log "下载 wgcf v${WGCF_VERSION} (${arch}) ..."
-    if ! curl -fSL --retry 3 -o "$WGCF_BIN" "$url"; then
-        rm -f "$WGCF_BIN"
-        die "下载 wgcf 失败: ${url}
-如服务器无法直连 GitHub，可手动下载后放置为 ${WGCF_BIN} 再重新运行本脚本。"
-    fi
+    fname="wgcf_${WGCF_VERSION}_linux_${arch}"
+    url="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/${fname}"
+    download_release "$url" "$WGCF_BIN" "$fname"
     chmod 0755 "$WGCF_BIN"
     log "wgcf 安装完成"
 }
