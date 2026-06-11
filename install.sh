@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 #
-# warp-proxy-setup :: install.sh
+# warp-proxy-setup :: install.sh (v0.2)
 #
 # 一键把 Linux 服务器变成一个基于 Cloudflare WARP 出口的本机通用 HTTP 代理节点。
 #
-#   Cloudflare WARP Local proxy mode
-#     ↓ 127.0.0.1:40000  SOCKS5 / WARP 原始代理入口
-#   GOST v2 协议桥接
-#     ↓ 127.0.0.1:18080  通用 HTTP 代理入口
-#   git / curl / wget / npm / apt / Docker / RSSHub / Node.js ...
+#   入口层（统一）：sing-box HTTP inbound → http://127.0.0.1:18080
+#   出口层（backend 可选）：
+#     warp-cli   官方客户端 Local proxy (127.0.0.1:40000)，官方支持系统的默认
+#     wireguard  wgcf + sing-box 用户态 WireGuard endpoint，CentOS 7 等系统的兜底
 #
 # 用法：
-#   sudo ./install.sh                          # 默认 local 模式（仅监听 127.0.0.1）
-#   sudo ./install.sh --mode docker-bridge     # 监听 docker0 网关 IP，供 bridge 容器使用
+#   sudo ./install.sh                          # --backend auto（按系统自动选择）
+#   sudo ./install.sh --backend warp-cli       # 强制官方客户端
+#   sudo ./install.sh --backend wireguard      # 强制 wgcf + 用户态 WireGuard
+#   sudo ./install.sh --mode docker-bridge     # 监听 docker0 网关 IP
 #   sudo ./install.sh --mode lan               # 监听 0.0.0.0（必须自行配置防火墙）
-#   sudo ./install.sh --host 172.18.0.1        # 显式指定监听地址（覆盖 mode 推导）
+#   sudo ./install.sh --host 172.18.0.1        # 显式指定监听地址
 #   sudo ./install.sh --port 18080             # 自定义 HTTP 代理端口
 #
 set -euo pipefail
@@ -22,14 +23,22 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # 常量与默认配置
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="0.1.0"
+readonly SCRIPT_VERSION="0.2.0"
 readonly CONFIG_DIR="/etc/warp-proxy"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.env"
+readonly SINGBOX_CONFIG="${CONFIG_DIR}/sing-box.json"
+readonly WGCF_DIR="${CONFIG_DIR}/wgcf"
 readonly BRIDGE_SERVICE="warp-proxy-bridge"
 readonly BRIDGE_UNIT="/etc/systemd/system/${BRIDGE_SERVICE}.service"
-readonly GOST_BIN="/usr/local/bin/gost"
-readonly GOST_VERSION="${GOST_VERSION:-2.12.0}"
+readonly SINGBOX_BIN="/usr/local/bin/sing-box"
+readonly WGCF_BIN="/usr/local/bin/wgcf"
+# 版本锁定：sing-box 1.11+ 的 wireguard endpoint 格式有过破坏性变更，不追 latest
+readonly SING_BOX_VERSION="${SING_BOX_VERSION:-1.12.4}"
+readonly WGCF_VERSION="${WGCF_VERSION:-2.2.26}"
+# WARP WireGuard 端点域名解析失败时的回退锚点
+readonly WARP_ENDPOINT_FALLBACK_IP="162.159.192.1"
 
+BACKEND="auto"
 MODE="local"
 HTTP_LISTEN_HOST=""
 HTTP_PROXY_PORT="18080"
@@ -45,7 +54,7 @@ err()  { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
 usage() {
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -55,6 +64,9 @@ usage() {
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
+            --backend)
+                BACKEND="${2:?--backend 需要参数: auto | warp-cli | wireguard}"
+                shift 2 ;;
             --mode)
                 MODE="${2:?--mode 需要参数: local | docker-bridge | lan}"
                 shift 2 ;;
@@ -67,13 +79,16 @@ parse_args() {
             -h|--help)
                 usage ;;
             install)
-                # 兼容 ./install.sh install 写法
                 shift ;;
             *)
                 die "未知参数: $1（使用 --help 查看用法）" ;;
         esac
     done
 
+    case "$BACKEND" in
+        auto|warp-cli|wireguard) ;;
+        *) die "非法 --backend: ${BACKEND}（支持 auto | warp-cli | wireguard）" ;;
+    esac
     case "$MODE" in
         local|docker-bridge|lan) ;;
         *) die "非法 --mode: ${MODE}（支持 local | docker-bridge | lan）" ;;
@@ -92,7 +107,6 @@ resolve_listen_host() {
             HTTP_LISTEN_HOST="127.0.0.1"
             ;;
         docker-bridge)
-            # 使用 awk 获取 docker0 IP，比 grep -P 兼容性更好
             local docker_ip
             docker_ip=$(ip -4 addr show docker0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)
             if [ -n "$docker_ip" ]; then
@@ -118,7 +132,7 @@ resolve_listen_host() {
 }
 
 # ---------------------------------------------------------------------------
-# 环境检查
+# 环境检查与 backend 判定
 # ---------------------------------------------------------------------------
 require_root() {
     [ "$(id -u)" -eq 0 ] || die "请使用 root 运行（sudo ./install.sh）"
@@ -140,7 +154,7 @@ detect_pkg_manager() {
     fi
 }
 
-detect_gost_arch() {
+detect_arch() {
     local arch
     arch=$(uname -m)
     case "$arch" in
@@ -151,8 +165,56 @@ detect_gost_arch() {
     esac
 }
 
+# Cloudflare WARP 官方客户端是否支持当前系统
+# 支持列表: Ubuntu 22.04+/Debian 12+/RHEL·CentOS 8+/Fedora 34+
+os_officially_supported() {
+    [ -f /etc/os-release ] || return 1
+    local id version_id major
+    id=$(. /etc/os-release && echo "${ID:-}")
+    version_id=$(. /etc/os-release && echo "${VERSION_ID:-}")
+    major=${version_id%%.*}
+    case "$id" in
+        ubuntu) [ "${major:-0}" -ge 22 ] ;;
+        debian) [ "${major:-0}" -ge 12 ] ;;
+        centos) [ "${major:-0}" -ge 8 ] ;;
+        rhel)   [ "${major:-0}" -ge 8 ] ;;
+        fedora) [ "${major:-0}" -ge 34 ] ;;
+        *)      return 1 ;;
+    esac
+}
+
+os_pretty_name() {
+    [ -f /etc/os-release ] && (. /etc/os-release && echo "${PRETTY_NAME:-unknown}") || echo "unknown"
+}
+
+resolve_backend() {
+    case "$BACKEND" in
+        auto)
+            if os_officially_supported; then
+                BACKEND="warp-cli"
+                log "系统 $(os_pretty_name) 在 Cloudflare 官方支持列表内 → backend=warp-cli"
+            else
+                BACKEND="wireguard"
+                warn "系统 $(os_pretty_name) 不在 Cloudflare WARP 官方客户端支持列表内"
+                warn "（官方支持: Ubuntu 22.04+/Debian 12+/RHEL·CentOS 8+/Fedora 34+）"
+                warn "自动切换 backend=wireguard（wgcf + sing-box 用户态 WireGuard）。"
+                warn "注意：wgcf 为非官方工具，调用 Cloudflare 未公开 API，存在接口变更失效的可能。"
+            fi
+            ;;
+        warp-cli)
+            if ! os_officially_supported; then
+                die "当前系统 $(os_pretty_name) 不被 Cloudflare WARP 官方客户端支持，无法使用 --backend warp-cli。
+请改用 --backend wireguard（或 --backend auto 自动选择）。"
+            fi
+            ;;
+        wireguard)
+            warn "已强制 backend=wireguard。注意 wgcf 为非官方工具，官方支持的系统上推荐 warp-cli。"
+            ;;
+    esac
+}
+
 # ---------------------------------------------------------------------------
-# 安装 Cloudflare WARP Client
+# 安装 Cloudflare WARP Client（仅 warp-cli backend）
 # ---------------------------------------------------------------------------
 install_warp() {
     if command -v warp-cli >/dev/null 2>&1; then
@@ -192,42 +254,130 @@ install_warp() {
 }
 
 # ---------------------------------------------------------------------------
-# 安装 GOST v2（单二进制，按架构下载）
+# 安装 sing-box（统一桥接层，单二进制，版本锁定）
 # ---------------------------------------------------------------------------
-install_gost() {
-    if [ -x "$GOST_BIN" ]; then
-        log "gost 已存在于 ${GOST_BIN}，跳过安装（当前版本: $("$GOST_BIN" -V 2>&1 | head -n1 || true)）"
-        return
+install_sing_box() {
+    if [ -x "$SINGBOX_BIN" ]; then
+        local cur
+        cur=$("$SINGBOX_BIN" version 2>/dev/null | head -n1 || true)
+        if echo "$cur" | grep -q "$SING_BOX_VERSION"; then
+            log "sing-box ${SING_BOX_VERSION} 已安装，跳过"
+            return
+        fi
+        warn "检测到已有 sing-box（${cur:-未知版本}），将替换为锁定版本 ${SING_BOX_VERSION}"
     fi
 
-    local gost_arch tarball url tmpdir
-    gost_arch=$(detect_gost_arch)
-    tarball="gost_${GOST_VERSION}_linux_${gost_arch}.tar.gz"
-    url="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/${tarball}"
+    local arch dirname tarball url tmpdir
+    arch=$(detect_arch)
+    dirname="sing-box-${SING_BOX_VERSION}-linux-${arch}"
+    tarball="${dirname}.tar.gz"
+    url="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${tarball}"
     tmpdir=$(mktemp -d)
-    trap 'rm -rf "$tmpdir"' RETURN
 
-    log "下载 GOST v${GOST_VERSION} (${gost_arch}) ..."
+    log "下载 sing-box v${SING_BOX_VERSION} (${arch}) ..."
     if ! curl -fSL --retry 3 -o "${tmpdir}/${tarball}" "$url"; then
-        die "下载 gost 失败: ${url}
-如服务器无法直连 GitHub，可手动下载后放置为 ${GOST_BIN} 再重新运行本脚本。"
+        rm -rf "$tmpdir"
+        die "下载 sing-box 失败: ${url}
+如服务器无法直连 GitHub，可手动下载后放置为 ${SINGBOX_BIN} 再重新运行本脚本。"
     fi
 
     tar -xzf "${tmpdir}/${tarball}" -C "$tmpdir"
-    # 压缩包内二进制名为 gost
-    install -m 0755 "${tmpdir}/gost" "$GOST_BIN"
-    log "gost 安装完成: $("$GOST_BIN" -V 2>&1 | head -n1 || echo "$GOST_BIN")"
+    install -m 0755 "${tmpdir}/${dirname}/sing-box" "$SINGBOX_BIN"
+    rm -rf "$tmpdir"
+    log "sing-box 安装完成: $("$SINGBOX_BIN" version 2>/dev/null | head -n1 || echo "$SINGBOX_BIN")"
 }
 
 # ---------------------------------------------------------------------------
-# WARP 幂等配置：状态达成就不重复操作
+# wgcf：安装、注册、生成并解析 WireGuard profile（仅 wireguard backend）
+# ---------------------------------------------------------------------------
+install_wgcf() {
+    if [ -x "$WGCF_BIN" ]; then
+        log "wgcf 已安装，跳过"
+        return
+    fi
+    local arch url
+    arch=$(detect_arch)
+    url="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_${arch}"
+    log "下载 wgcf v${WGCF_VERSION} (${arch}) ..."
+    if ! curl -fSL --retry 3 -o "$WGCF_BIN" "$url"; then
+        rm -f "$WGCF_BIN"
+        die "下载 wgcf 失败: ${url}
+如服务器无法直连 GitHub，可手动下载后放置为 ${WGCF_BIN} 再重新运行本脚本。"
+    fi
+    chmod 0755 "$WGCF_BIN"
+    log "wgcf 安装完成"
+}
+
+# 幂等：账号/与 profile 文件存在即跳过对应步骤
+wgcf_register_and_generate() {
+    mkdir -p "$WGCF_DIR"
+    chmod 700 "$WGCF_DIR"
+
+    if [ -f "${WGCF_DIR}/wgcf-account.toml" ]; then
+        log "WARP 账号已存在（${WGCF_DIR}/wgcf-account.toml），跳过注册"
+    else
+        log "通过 wgcf 注册 WARP 账号..."
+        (cd "$WGCF_DIR" && "$WGCF_BIN" register --accept-tos) \
+            || die "wgcf 注册失败。可能原因：Cloudflare 注册接口变更 / 网络无法访问 api.cloudflareclient.com"
+        chmod 600 "${WGCF_DIR}/wgcf-account.toml"
+    fi
+
+    if [ -f "${WGCF_DIR}/wgcf-profile.conf" ]; then
+        log "WireGuard profile 已存在，跳过生成"
+    else
+        log "生成 WireGuard profile..."
+        (cd "$WGCF_DIR" && "$WGCF_BIN" generate) || die "wgcf generate 失败"
+        chmod 600 "${WGCF_DIR}/wgcf-profile.conf"
+    fi
+}
+
+# 从 wgcf-profile.conf 提取一个 ini 键的值（取第一个匹配）。
+# 注意：只剥掉第一个 "key =" 前缀，不能按 "=" 整体分列——
+# WireGuard 密钥是 base64，末尾的 "=" 会被 awk -F'=' 截掉导致握手失败。
+profile_get() {
+    sed -n "s/^${1}[[:space:]]*=[[:space:]]*//p" "${WGCF_DIR}/wgcf-profile.conf" | head -n 1 | tr -d ' \r'
+}
+
+# 解析 profile 并渲染 sing-box wireguard endpoint 所需变量：
+# WG_PRIVATE_KEY / WG_ADDRESS_JSON / WG_PEER_PUBLIC_KEY / WG_PEER_IP / WG_PEER_PORT
+parse_wgcf_profile() {
+    WG_PRIVATE_KEY=$(profile_get "PrivateKey")
+    WG_PEER_PUBLIC_KEY=$(profile_get "PublicKey")
+    local endpoint addresses
+    endpoint=$(profile_get "Endpoint")
+    # Address 可能是单行逗号分隔，也可能多行；统一收集后拼 JSON 数组
+    addresses=$(sed -n 's/^Address[[:space:]]*=[[:space:]]*//p' "${WGCF_DIR}/wgcf-profile.conf" \
+        | tr ',' '\n' | tr -d ' \r' | grep -v '^$')
+
+    [ -n "$WG_PRIVATE_KEY" ]    || die "未能从 wgcf-profile.conf 解析 PrivateKey"
+    [ -n "$WG_PEER_PUBLIC_KEY" ] || die "未能从 wgcf-profile.conf 解析 PublicKey"
+    [ -n "$addresses" ]          || die "未能从 wgcf-profile.conf 解析 Address"
+
+    WG_ADDRESS_JSON=$(echo "$addresses" | awk '{printf "%s\"%s\"", (NR>1?", ":""), $0}')
+
+    # Endpoint 形如 engage.cloudflareclient.com:2408，解析域名为 IP（失败回退锚点 IP）
+    local host port ip
+    host=${endpoint%:*}
+    port=${endpoint##*:}
+    [ -n "$port" ] || port="2408"
+    ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')
+    if [ -z "$ip" ]; then
+        warn "无法解析 WARP 端点域名 ${host}，回退使用锚点 IP ${WARP_ENDPOINT_FALLBACK_IP}"
+        ip="$WARP_ENDPOINT_FALLBACK_IP"
+    fi
+    WG_PEER_IP="$ip"
+    WG_PEER_PORT="$port"
+    log "WARP WireGuard 端点: ${WG_PEER_IP}:${WG_PEER_PORT}"
+}
+
+# ---------------------------------------------------------------------------
+# WARP 官方客户端幂等配置（仅 warp-cli backend）
 # ---------------------------------------------------------------------------
 warp_status() {
     warp-cli --accept-tos status 2>/dev/null || echo "Unknown"
 }
 
 warp_is_registered() {
-    # 新版：registration show；旧版：status 不报 Registration Missing
     if warp-cli --accept-tos registration show >/dev/null 2>&1; then
         return 0
     fi
@@ -240,7 +390,6 @@ configure_warp() {
     log "确保 warp-svc 服务运行..."
     systemctl enable --now warp-svc
 
-    # 等待 warp-svc IPC 就绪
     local i
     for i in $(seq 1 15); do
         if warp-cli --accept-tos status >/dev/null 2>&1; then
@@ -277,12 +426,13 @@ configure_warp() {
 }
 
 # ---------------------------------------------------------------------------
-# 配置文件 + systemd 桥接服务
+# 配置文件 + sing-box 配置 + systemd 桥接服务
 # ---------------------------------------------------------------------------
 write_config() {
     mkdir -p "$CONFIG_DIR"
     cat > "$CONFIG_FILE" <<EOF
 # Generated by warp-proxy-setup v${SCRIPT_VERSION} -- $(date '+%Y-%m-%d %H:%M:%S')
+BACKEND=${BACKEND}
 MODE=${MODE}
 WARP_PROXY_HOST=${WARP_PROXY_HOST}
 WARP_PROXY_PORT=${WARP_PROXY_PORT}
@@ -292,21 +442,94 @@ EOF
     log "配置已写入 ${CONFIG_FILE}"
 }
 
+write_singbox_config() {
+    if [ "$BACKEND" = "warp-cli" ]; then
+        cat > "$SINGBOX_CONFIG" <<EOF
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    {
+      "type": "http",
+      "tag": "http-in",
+      "listen": "${HTTP_LISTEN_HOST}",
+      "listen_port": ${HTTP_PROXY_PORT}
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "socks",
+      "tag": "warp-socks",
+      "server": "${WARP_PROXY_HOST}",
+      "server_port": ${WARP_PROXY_PORT}
+    }
+  ],
+  "route": { "final": "warp-socks" }
+}
+EOF
+    else
+        cat > "$SINGBOX_CONFIG" <<EOF
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    {
+      "type": "http",
+      "tag": "http-in",
+      "listen": "${HTTP_LISTEN_HOST}",
+      "listen_port": ${HTTP_PROXY_PORT}
+    }
+  ],
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "warp-wg",
+      "mtu": 1280,
+      "address": [${WG_ADDRESS_JSON}],
+      "private_key": "${WG_PRIVATE_KEY}",
+      "peers": [
+        {
+          "address": "${WG_PEER_IP}",
+          "port": ${WG_PEER_PORT},
+          "public_key": "${WG_PEER_PUBLIC_KEY}",
+          "allowed_ips": ["0.0.0.0/0", "::/0"],
+          "persistent_keepalive_interval": 25
+        }
+      ]
+    }
+  ],
+  "route": { "final": "warp-wg" }
+}
+EOF
+    fi
+    chmod 600 "$SINGBOX_CONFIG"
+
+    "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG" \
+        || die "sing-box 配置校验失败: ${SINGBOX_CONFIG}"
+    log "sing-box 配置已生成并通过校验: ${SINGBOX_CONFIG}"
+}
+
 write_bridge_service() {
-    cat > "$BRIDGE_UNIT" <<'EOF'
+    # systemd 兼容性：CentOS 7 是 systemd 219，
+    # 必须用 legacy 的 [Service] StartLimitInterval= 写法（新版 systemd 同样接受）
+    local after="network-online.target"
+    local pre=""
+    if [ "$BACKEND" = "warp-cli" ]; then
+        after="network-online.target warp-svc.service"
+        # /dev/tcp 是 Bash 特性，必须 /bin/bash；等待 WARP Local proxy 40000 就绪
+        pre="ExecStartPre=/bin/bash -c 'for i in {1..30}; do (echo > /dev/tcp/${WARP_PROXY_HOST}/${WARP_PROXY_PORT}) >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'"
+    fi
+
+    cat > "$BRIDGE_UNIT" <<EOF
 [Unit]
-Description=HTTP proxy bridge to Cloudflare WARP Local proxy
-After=network-online.target warp-svc.service
+Description=WARP HTTP proxy bridge (sing-box, backend=${BACKEND})
+After=${after}
 Wants=network-online.target
 
 [Service]
-EnvironmentFile=/etc/warp-proxy/config.env
-# 必须使用 /bin/bash：/dev/tcp 是 Bash 特性，/bin/sh (dash) 不支持
-ExecStartPre=/bin/bash -c 'for i in {1..30}; do (echo > /dev/tcp/${WARP_PROXY_HOST}/${WARP_PROXY_PORT}) >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
-ExecStart=/usr/local/bin/gost -L=http://${HTTP_LISTEN_HOST}:${HTTP_PROXY_PORT} -F=socks5://${WARP_PROXY_HOST}:${WARP_PROXY_PORT}
+${pre}
+ExecStart=${SINGBOX_BIN} run -c ${SINGBOX_CONFIG}
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=60
+StartLimitInterval=60
 StartLimitBurst=5
 
 [Install]
@@ -316,58 +539,80 @@ EOF
     systemctl daemon-reload
     systemctl enable "$BRIDGE_SERVICE"
     systemctl restart "$BRIDGE_SERVICE"
-    log "systemd 桥接服务已启动: ${BRIDGE_SERVICE}"
+    log "systemd 桥接服务已启动: ${BRIDGE_SERVICE} (backend=${BACKEND})"
+}
+
+# v0.1 遗留清理：GOST 已被 sing-box 取代
+cleanup_v01_gost() {
+    if [ -x /usr/local/bin/gost ]; then
+        warn "检测到 v0.1 遗留的 /usr/local/bin/gost，桥接层已统一为 sing-box，移除 gost"
+        rm -f /usr/local/bin/gost
+    fi
 }
 
 # ---------------------------------------------------------------------------
-# 三层健康检查
+# 三层健康检查（v0.2：L1 出口层 / L2 入口连通 / L3 出口归属 warp=on）
 # ---------------------------------------------------------------------------
 health_check() {
     local ok=0 fail=0
     echo
     log "================= 三层健康检查 ================="
 
-    # Level 1: WARP 服务状态
+    # Level 1: 出口层状态（按 backend 分叉）
     echo
-    log "[L1] WARP 服务状态 (warp-cli status)"
-    local st
-    st=$(warp_status)
-    echo "      ${st}" | head -n 3
-    if [[ "$st" == *"Connected"* ]]; then
-        log "[L1] PASS — WARP 已连接"
-        ok=$((ok+1))
+    if [ "$BACKEND" = "warp-cli" ]; then
+        log "[L1] WARP 官方客户端状态 (warp-cli status)"
+        local st
+        st=$(warp_status)
+        echo "      ${st}" | head -n 3
+        if [[ "$st" == *"Connected"* ]]; then
+            log "[L1] PASS — WARP 已连接"
+            ok=$((ok+1))
+        else
+            err "[L1] FAIL — WARP 未处于 Connected 状态。可能原因："
+            err "      1. 当前云服务器 IP 被 Cloudflare 限制"
+            err "      2. 服务器网络无法访问 Cloudflare WARP 节点"
+            err "      3. WARP 注册失败"
+            err "      4. 机器时间 / DNS / 防火墙异常"
+            fail=$((fail+1))
+        fi
     else
-        err "[L1] FAIL — WARP 未处于 Connected 状态。可能原因："
-        err "      1. 当前云服务器 IP 被 Cloudflare 限制"
-        err "      2. 服务器网络无法访问 Cloudflare WARP 节点"
-        err "      3. WARP 注册失败"
-        err "      4. 机器时间 / DNS / 防火墙异常"
-        fail=$((fail+1))
+        log "[L1] wireguard backend 出口层状态"
+        if systemctl is-active --quiet "$BRIDGE_SERVICE" && [ -f "${WGCF_DIR}/wgcf-profile.conf" ]; then
+            log "[L1] PASS — ${BRIDGE_SERVICE} 运行中，wgcf profile 就绪"
+            ok=$((ok+1))
+        else
+            err "[L1] FAIL — 桥接服务未运行或 wgcf profile 缺失"
+            err "      检查: systemctl status ${BRIDGE_SERVICE} ; ls ${WGCF_DIR}/"
+            fail=$((fail+1))
+        fi
     fi
 
-    # Level 2: WARP Local proxy (SOCKS5) 是否可用
-    echo
-    log "[L2] WARP Local proxy 连通性 (socks5h://${WARP_PROXY_HOST}:${WARP_PROXY_PORT})"
-    if curl -sI -x "socks5h://${WARP_PROXY_HOST}:${WARP_PROXY_PORT}" \
-            https://www.cloudflare.com/cdn-cgi/trace --max-time 15 >/dev/null; then
-        log "[L2] PASS — SOCKS5 本地代理可用"
-        ok=$((ok+1))
-    else
-        err "[L2] FAIL — 无法通过 WARP SOCKS5 代理访问外网"
-        fail=$((fail+1))
-    fi
-
-    # Level 3: HTTP bridge 是否可用
+    # Level 2: 入口层连通性（两个 backend 一致）
     echo
     local probe_host="$HTTP_LISTEN_HOST"
     [ "$probe_host" = "0.0.0.0" ] && probe_host="127.0.0.1"
-    log "[L3] HTTP 桥接连通性 (http://${probe_host}:${HTTP_PROXY_PORT})"
-    if curl -sI -x "http://${probe_host}:${HTTP_PROXY_PORT}" \
-            https://www.cloudflare.com/cdn-cgi/trace --max-time 15 >/dev/null; then
-        log "[L3] PASS — 通用 HTTP 代理入口可用"
+    local trace=""
+    log "[L2] HTTP 代理入口连通性 (http://${probe_host}:${HTTP_PROXY_PORT})"
+    trace=$(curl -s -x "http://${probe_host}:${HTTP_PROXY_PORT}" \
+            https://www.cloudflare.com/cdn-cgi/trace --max-time 20 || true)
+    if [ -n "$trace" ]; then
+        log "[L2] PASS — 通用 HTTP 代理入口可用"
         ok=$((ok+1))
     else
-        err "[L3] FAIL — HTTP 桥接不可用，请检查: systemctl status ${BRIDGE_SERVICE}"
+        err "[L2] FAIL — 18080 入口不可用，请检查: systemctl status ${BRIDGE_SERVICE}"
+        fail=$((fail+1))
+    fi
+
+    # Level 3: 出口归属校验 — 流量是否真的走 WARP
+    echo
+    log "[L3] 出口归属校验 (cdn-cgi/trace 的 warp 字段)"
+    if echo "$trace" | grep -qE '^warp=(on|plus)$'; then
+        log "[L3] PASS — 出口确认为 Cloudflare WARP ($(echo "$trace" | grep '^warp='))"
+        ok=$((ok+1))
+    else
+        err "[L3] FAIL — 代理通了但出口不是 WARP（warp=$(echo "$trace" | awk -F= '/^warp=/{print $2}')）"
+        err "      检查 sing-box 出站配置 / WireGuard 握手: journalctl -u ${BRIDGE_SERVICE} -n 50"
         fail=$((fail+1))
     fi
 
@@ -387,7 +632,8 @@ print_usage_guide() {
     cat <<EOF
 
 ==================================================================
- 安装完成！通用 HTTP 代理入口: ${proxy}
+ 安装完成！backend=${BACKEND}
+ 通用 HTTP 代理入口: ${proxy}
 ==================================================================
 
 通用环境变量（RSSHub / Node.js / Python / Go / Java 等服务）:
@@ -400,7 +646,7 @@ Git:
     git config --global https.proxy ${proxy}
 
 curl:
-    curl -x ${proxy} https://www.google.com
+    curl -x ${proxy} https://www.cloudflare.com/cdn-cgi/trace
 
 wget:
     wget -e use_proxy=yes -e http_proxy=${proxy} -e https_proxy=${proxy} https://example.com
@@ -421,7 +667,7 @@ Docker daemon:
 
 管理命令:
     systemctl status ${BRIDGE_SERVICE}     # 查看桥接服务
-    warp-cli status                        # 查看 WARP 状态
+    journalctl -u ${BRIDGE_SERVICE} -f     # 桥接服务日志
     ./scripts/health-check.sh              # 重新执行三层健康检查
     ./uninstall.sh                         # 卸载
 
@@ -435,16 +681,27 @@ main() {
     parse_args "$@"
     require_root
     require_systemd
+    resolve_backend
 
-    log "warp-proxy-setup v${SCRIPT_VERSION} | mode=${MODE}"
+    log "warp-proxy-setup v${SCRIPT_VERSION} | backend=${BACKEND} | mode=${MODE}"
     resolve_listen_host
-    log "监听配置: http://${HTTP_LISTEN_HOST}:${HTTP_PROXY_PORT} -> socks5://${WARP_PROXY_HOST}:${WARP_PROXY_PORT}"
+    log "监听配置: http://${HTTP_LISTEN_HOST}:${HTTP_PROXY_PORT}"
 
-    install_warp
-    install_gost
-    configure_warp
+    install_sing_box
+
+    if [ "$BACKEND" = "warp-cli" ]; then
+        install_warp
+        configure_warp
+    else
+        install_wgcf
+        wgcf_register_and_generate
+        parse_wgcf_profile
+    fi
+
     write_config
+    write_singbox_config
     write_bridge_service
+    cleanup_v01_gost
 
     if health_check; then
         print_usage_guide

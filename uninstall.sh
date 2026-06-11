@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# warp-proxy-setup :: uninstall.sh
+# warp-proxy-setup :: uninstall.sh (v0.2)
 #
-# 卸载 warp-proxy 桥接层（systemd 服务 + 配置 + gost 二进制）。
-# Cloudflare WARP 客户端默认保留；如需一并移除，使用 --purge-warp。
+# 卸载桥接层（systemd 服务 + 配置 + sing-box/wgcf 二进制，含 v0.1 遗留 gost）。
+# Cloudflare WARP 官方客户端默认保留；如需一并移除，使用 --purge-warp。
 #
 # 用法：
-#   sudo ./uninstall.sh                # 移除桥接服务、配置与 gost
+#   sudo ./uninstall.sh                # 移除桥接服务、配置、sing-box/wgcf/gost
 #   sudo ./uninstall.sh --purge-warp   # 同时断开并卸载 cloudflare-warp
 #
 set -euo pipefail
@@ -14,6 +14,8 @@ set -euo pipefail
 readonly BRIDGE_SERVICE="warp-proxy-bridge"
 readonly BRIDGE_UNIT="/etc/systemd/system/${BRIDGE_SERVICE}.service"
 readonly CONFIG_DIR="/etc/warp-proxy"
+readonly SINGBOX_BIN="/usr/local/bin/sing-box"
+readonly WGCF_BIN="/usr/local/bin/wgcf"
 readonly GOST_BIN="/usr/local/bin/gost"
 
 PURGE_WARP=false
@@ -43,19 +45,21 @@ if [ -f "$BRIDGE_UNIT" ]; then
     log "已移除 systemd unit: ${BRIDGE_UNIT}"
 fi
 
-# 2. 移除配置
+# 2. 移除配置（含 sing-box.json 与 wgcf 账号/profile）
 if [ -d "$CONFIG_DIR" ]; then
     rm -rf "$CONFIG_DIR"
-    log "已移除配置目录: ${CONFIG_DIR}"
+    log "已移除配置目录: ${CONFIG_DIR}（含 wgcf 账号文件）"
 fi
 
-# 3. 移除 gost 二进制
-if [ -x "$GOST_BIN" ]; then
-    rm -f "$GOST_BIN"
-    log "已移除 gost: ${GOST_BIN}"
-fi
+# 3. 移除二进制：sing-box、wgcf，以及 v0.1 遗留的 gost
+for bin in "$SINGBOX_BIN" "$WGCF_BIN" "$GOST_BIN"; do
+    if [ -e "$bin" ]; then
+        rm -f "$bin"
+        log "已移除: ${bin}"
+    fi
+done
 
-# 4. 可选：卸载 Cloudflare WARP
+# 4. 可选：卸载 Cloudflare WARP 官方客户端
 if [ "$PURGE_WARP" = true ]; then
     if command -v warp-cli >/dev/null 2>&1; then
         log "断开 WARP 连接并删除注册..."
@@ -78,7 +82,9 @@ if [ "$PURGE_WARP" = true ]; then
         warn "无法识别包管理器，请手动卸载 cloudflare-warp"
     fi
 else
-    log "保留 Cloudflare WARP 客户端（如需一并卸载: sudo ./uninstall.sh --purge-warp）"
+    if command -v warp-cli >/dev/null 2>&1; then
+        log "保留 Cloudflare WARP 官方客户端（如需一并卸载: sudo ./uninstall.sh --purge-warp）"
+    fi
 fi
 
 log "卸载完成。"

@@ -3,23 +3,48 @@
 一键把 Linux 服务器变成一个基于 Cloudflare WARP 出口的本机**通用 HTTP 代理节点**。
 
 ```text
-Cloudflare WARP Local proxy mode
-    ↓
-127.0.0.1:40000  SOCKS5 / WARP 原始代理入口
-    ↓
-GOST v2 协议桥接
-    ↓
-127.0.0.1:18080  通用 HTTP 代理入口
-    ↓
+入口层（统一）
+  sing-box HTTP inbound → 127.0.0.1:18080
+
+出口层（backend 按系统自动选择）
+  backend=warp-cli   官方客户端 Local proxy (127.0.0.1:40000)
+  backend=wireguard  wgcf + sing-box 用户态 WireGuard（CentOS 7 等系统兜底）
+
+  ↓
 所有支持 HTTP_PROXY / HTTPS_PROXY 的应用
 ```
 
-`40000` 是 WARP 原始能力，`18080` 是应用兼容能力——它不是“Docker 专用代理入口”，而是一个 HTTP 代理兼容层，服务于：
+`18080` 不是“Docker 专用代理入口”，而是一个 HTTP 代理兼容层，服务于：
 
 - 命令行工具：curl、wget、git
 - 包管理器：apt、yum、dnf、npm、pnpm、yarn、pip
 - 容器相关：Docker daemon、docker build、docker-compose 服务
 - 应用服务：RSSHub、Node.js、Python、Go、Java 等
+
+## 系统支持与 backend 选择
+
+`--backend auto`（默认）按系统自动选择出口方案：
+
+| 系统 | auto 选择 | 方式 |
+| ---- | --------- | ---- |
+| Ubuntu 22.04 / 24.04 LTS | `warp-cli` | 官方客户端 + Local proxy 40000 |
+| Debian 12+ | `warp-cli` | 官方客户端 + Local proxy 40000 |
+| RHEL / CentOS 8+ | `warp-cli` | 官方客户端 + Local proxy 40000 |
+| Fedora 34+ | `warp-cli` | 官方客户端 + Local proxy 40000 |
+| CentOS 7 等其他系统 | `wireguard` | wgcf + sing-box 用户态 WireGuard |
+
+说明：
+
+- 官方支持的系统上默认始终用 `warp-cli`；[wgcf](https://github.com/ViRb3/wgcf) 是非官方工具（调用 Cloudflare 未公开 API），只作为官方客户端覆盖不到的系统的兜底。
+- wireguard backend 是**纯用户态**实现：不装内核模块、不碰路由表、不改默认路由，SSH 与已有服务出站不受影响（CentOS 7 的 3.10 内核没有内核态 WireGuard，这正是 sing-box 方案成立的原因）。
+- 另需 systemd 与 root 权限。
+
+强制指定 backend：
+
+```bash
+sudo ./install.sh --backend warp-cli     # 系统不支持时直接报错，不静默降级
+sudo ./install.sh --backend wireguard
+```
 
 ## 快速开始
 
@@ -31,11 +56,14 @@ sudo ./install.sh
 
 脚本会自动完成：
 
-1. 安装 Cloudflare WARP Client（apt / dnf / yum 自适应）
-2. 安装 GOST v2（单二进制，按 amd64 / arm64 / armv7 架构下载）
-3. 幂等注册 WARP 并开启 Local proxy mode（端口 40000，新旧 `warp-cli` 命令自动 fallback）
-4. 写入 systemd 桥接服务（带 `/dev/tcp` 端口就绪等待，开机自启）
-5. 执行三层健康检查并输出各类应用的接入方式
+1. 按系统选定 backend，安装 sing-box（统一桥接层，版本锁定，按 amd64 / arm64 / armv7 架构下载）
+2. `warp-cli` backend：安装官方客户端（apt / dnf / yum 自适应），幂等注册并开启 Local proxy mode（新旧 `warp-cli` 命令自动 fallback）
+3. `wireguard` backend：安装 wgcf，幂等注册 WARP 账号并生成 WireGuard profile
+4. 渲染 sing-box 配置（HTTP inbound 18080 → socks/wireguard 出站）并 `sing-box check` 校验
+5. 写入 systemd 桥接服务（兼容 CentOS 7 的 systemd 219；warp-cli backend 带 `/dev/tcp` 端口就绪等待）
+6. 执行三层健康检查并输出各类应用的接入方式
+
+从 v0.1 升级：直接重跑 `sudo ./install.sh`，桥接层会自动从 GOST 切换为 sing-box 并清理遗留二进制。
 
 ## 监听模式
 
@@ -99,11 +127,11 @@ sudo systemctl daemon-reload && sudo systemctl restart docker
 
 | 层级 | 检查内容 | 失败时的含义 |
 | ---- | -------- | ------------ |
-| L1 | `warp-cli status` 是否 Connected | WARP 本身连不上：IP 被 Cloudflare 风控 / 网络不通 / 注册失败 / 时间·DNS·防火墙异常 |
-| L2 | `socks5h://127.0.0.1:40000` 能否出网 | WARP 进程在但本地代理口不可用 |
-| L3 | `http://127.0.0.1:18080` 能否出网 | gost 桥接层故障，查 `systemctl status warp-proxy-bridge` |
+| L1 | 出口层状态（warp-cli: `warp-cli status`；wireguard: 桥接服务 + wgcf profile） | WARP 出口层没起来：IP 被 Cloudflare 风控 / 网络不通 / 注册失败 / 时间·DNS·防火墙异常 |
+| L2 | `http://127.0.0.1:18080` 能否出网 | sing-box 桥接层故障，查 `systemctl status warp-proxy-bridge` |
+| L3 | trace 响应里 `warp=on/plus` | 代理通了但流量没走 WARP：检查 sing-box 出站配置 / WireGuard 握手 |
 
-L1、L2 都通但应用代理失败 → 要么 L3 桥接出错，要么应用侧的代理环境变量配置有误。
+L3 比单纯的连通性检查更强——它验证的是「流量真的从 Cloudflare WARP 出口出去了」。三层全过但应用仍失败 → 应用侧的代理环境变量配置有误。
 
 常用管理命令：
 
@@ -116,15 +144,16 @@ warp-cli status                      # WARP 连接状态
 ## 卸载
 
 ```bash
-sudo ./uninstall.sh                # 移除桥接服务、配置与 gost，保留 WARP 客户端
-sudo ./uninstall.sh --purge-warp   # 同时断开并卸载 cloudflare-warp
+sudo ./uninstall.sh                # 移除桥接服务、配置、sing-box/wgcf（含 v0.1 遗留 gost）
+sudo ./uninstall.sh --purge-warp   # 同时断开并卸载 cloudflare-warp 官方客户端
 ```
 
 卸载后请记得清理应用侧的代理配置（Git / npm / apt / Docker daemon 等），否则它们会因代理失联而请求失败。
 
 ## 设计文档
 
-完整方案设计（技术选型、systemd 就绪等待、幂等逻辑、多模式安全设计）见 [docs/design.md](docs/design.md)。
+- [docs/design.md](docs/design.md) — v0.1：问题域分析、为什么需要 18080、多监听模式、幂等原则
+- [docs/design-v0.2.md](docs/design-v0.2.md) — v0.2：双 backend 架构、sing-box 统一桥接、wgcf 方案与风险、CentOS 7 适配、warp=on 健康检查
 
 ## License
 
