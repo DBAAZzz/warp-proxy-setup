@@ -128,10 +128,11 @@ GitHub 直连
 3. 生成配置（幂等：profile 存在则跳过）
      wgcf generate → wgcf-profile.conf
 4. 解析 profile 中的 PrivateKey / Address / PublicKey / Endpoint
-5. Endpoint 域名（engage.cloudflareclient.com）解析为 IP
+5. 从 wgcf-account.toml 解析 client_id → 解码为 3 字节 reserved 值（见下）
+6. Endpoint 域名（engage.cloudflareclient.com）解析为 IP
      解析失败时回退到已知锚点 IP 162.159.192.1:2408
-6. 渲染 sing-box 配置（wireguard endpoint 格式，MTU 1280）
-7. 写入 systemd unit 并启动
+7. 渲染 sing-box 配置（wireguard endpoint 格式，MTU 1280）
+8. 写入 systemd unit 并启动
 ```
 
 sing-box wireguard endpoint 配置模板（1.11+ 格式）：
@@ -154,6 +155,7 @@ sing-box wireguard endpoint 配置模板（1.11+ 格式）：
           "address": "162.159.192.1",
           "port": 2408,
           "public_key": "<wgcf PublicKey>",
+          "reserved": [<client_id 解码的 3 字节>],
           "allowed_ips": ["0.0.0.0/0", "::/0"],
           "persistent_keepalive_interval": 25
         }
@@ -164,7 +166,13 @@ sing-box wireguard endpoint 配置模板（1.11+ 格式）：
 }
 ```
 
-已知 caveat：标准 WireGuard 客户端直接使用 wgcf profile 即可工作，因此不解析 `reserved` 字段；若遇到握手成功但流量不通的场景，排障方向之一是从 WARP 账号的 client_id 提取 3 字节 reserved 值填入 peer 配置（排障文档记录，不进 v0.2 主流程）。
+**reserved 字段（必须，真机验证过的坑）：** WARP 要求 WireGuard 包头携带 3 字节 client_id（即 `reserved`），wgcf 生成的 profile 里**不含**这个字段。缺少它的症状极具迷惑性：UDP 端点可达、sing-box 日志无任何报错、服务状态 active，但所有经隧道的数据包被 Cloudflare **静默丢弃**，表现为代理请求整体挂起（CentOS 7 真机复现）。标准 WireGuard 客户端不受影响是因为 wgcf 注册的账号配合官方 IP 段路由时 Cloudflare 侧放行，但 sing-box 用户态实现必须显式携带。安装流程从 `wgcf-account.toml` 提取 `client_id`（base64）：
+
+```bash
+client_id 'kc1y' → base64 -d → od -tu1 → [145, 205, 114]
+```
+
+解析失败（无 client_id / 解码不是 3 字节）时降级为不渲染 reserved 并输出警告，不中断安装。
 
 ---
 

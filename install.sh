@@ -409,7 +409,7 @@ profile_get() {
 }
 
 # 解析 profile 并渲染 sing-box wireguard endpoint 所需变量：
-# WG_PRIVATE_KEY / WG_ADDRESS_JSON / WG_PEER_PUBLIC_KEY / WG_PEER_IP / WG_PEER_PORT
+# WG_PRIVATE_KEY / WG_ADDRESS_JSON / WG_PEER_PUBLIC_KEY / WG_PEER_IP / WG_PEER_PORT / WG_RESERVED_JSON
 parse_wgcf_profile() {
     WG_PRIVATE_KEY=$(profile_get "PrivateKey")
     WG_PEER_PUBLIC_KEY=$(profile_get "PublicKey")
@@ -438,6 +438,37 @@ parse_wgcf_profile() {
     WG_PEER_IP="$ip"
     WG_PEER_PORT="$port"
     log "WARP WireGuard 端点: ${WG_PEER_IP}:${WG_PEER_PORT}"
+
+    parse_wgcf_reserved
+}
+
+# WARP 要求 WireGuard 包头携带 3 字节 client_id（reserved 字段）。
+# wgcf 的 profile 不含它，必须从 wgcf-account.toml 的 client_id（base64）解码。
+# 缺少 reserved 的典型症状：握手"成功"、无报错，但所有数据包被 Cloudflare 静默丢弃。
+parse_wgcf_reserved() {
+    WG_RESERVED_JSON=""
+    local client_id
+    client_id=$(sed -n "s/^client_id[[:space:]]*=[[:space:]]*['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}$/\1/p" \
+        "${WGCF_DIR}/wgcf-account.toml" | head -n 1 | tr -d ' \r')
+
+    if [ -z "$client_id" ]; then
+        warn "wgcf-account.toml 中未找到 client_id，跳过 reserved 字段（若代理挂起需手动排障）"
+        return
+    fi
+
+    local bytes
+    bytes=$(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1 \
+        | tr -s ' \n' ' ' | sed 's/^ //; s/ $//; s/ /, /g')
+
+    local count
+    count=$(echo "$bytes" | awk -F', ' '{print NF}')
+    if [ -z "$bytes" ] || [ "$count" -ne 3 ]; then
+        warn "client_id 解码异常（得到 ${count:-0} 字节，期望 3），跳过 reserved 字段"
+        return
+    fi
+
+    WG_RESERVED_JSON="$bytes"
+    log "已从 wgcf 账号解析 reserved 字段: [${WG_RESERVED_JSON}]"
 }
 
 # ---------------------------------------------------------------------------
@@ -537,6 +568,11 @@ write_singbox_config() {
 }
 EOF
     else
+        local reserved_line=""
+        if [ -n "${WG_RESERVED_JSON:-}" ]; then
+            reserved_line="
+          \"reserved\": [${WG_RESERVED_JSON}],"
+        fi
         cat > "$SINGBOX_CONFIG" <<EOF
 {
   "log": { "level": "warn" },
@@ -559,7 +595,7 @@ EOF
         {
           "address": "${WG_PEER_IP}",
           "port": ${WG_PEER_PORT},
-          "public_key": "${WG_PEER_PUBLIC_KEY}",
+          "public_key": "${WG_PEER_PUBLIC_KEY}",${reserved_line}
           "allowed_ips": ["0.0.0.0/0", "::/0"],
           "persistent_keepalive_interval": 25
         }
